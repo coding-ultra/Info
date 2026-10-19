@@ -255,7 +255,7 @@ execute_theme_action() {
 
         step "2/2" "Applying permissions and rebuilding panel..."
         (
-            grep -rl "2.1.[0-9]" resources/ config/ app/ 2>/dev/null | xargs -r sed -i 's/2.1.[0-9]/2.1.2/g' || true
+            grep -rl "2.1.[0-9]" resources/ config/ app/ 2>/dev/null | xargs -r sed -i 's/2.1.[0-9]/2.1.4/g' || true
             php artisan view:clear > /dev/null 2>&1
             php artisan optimize:clear > /dev/null 2>&1
             cd /var/www/pterodactyl
@@ -2465,6 +2465,18 @@ EOF
 
 # Saare caches aggressively delete karna
 cd /var/www/pterodactyl
+grep -rl "2.1.[0-9]" resources/ config/ app/ 2>/dev/null | xargs -r sed -i 's/2.1.[0-9]/2.1.4/g' || true
+            php artisan view:clear > /dev/null 2>&1
+            php artisan optimize:clear > /dev/null 2>&1
+            cd /var/www/pterodactyl
+            sed -i "s/'version' => '[0-9.]*'/'version' => '1.15.1'/g" config/app.php || true
+            php artisan config:clear > /dev/null 2>&1
+            php artisan optimize:clear > /dev/null 2>&1
+            cd /var/www/pterodactyl
+            yarn add xterm-addon-unicode11 > /dev/null 2>&1
+            export NODE_OPTIONS=--openssl-legacy-provider
+            yarn build > /dev/null 2>&1
+            
 php artisan view:clear
 php artisan cache:clear
 php artisan config:clear
