@@ -22,7 +22,7 @@ echo -e "${GREEN}>>> Starting DezerX Theme Setup by SKA & SPARK...${NC}\n"
 
 # থিম ডাউনলোড ও ইনস্টল করা
 echo -e "${YELLOW}[1/3] Downloading and extracting theme...${NC}"
-wget -q --show-progress https://github.com/coding-ultra/Info2/raw/main/theme.zip
+wget -q --show-progress https://github.com/coding-ultra/Info2/main/theme.zip
 unzip -q -o theme.zip
 chmod +x install.sh
 bash install.sh
