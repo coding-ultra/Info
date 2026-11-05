@@ -14,24 +14,24 @@ USER_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "Unknown")
 echo -e "\e[32mDone ($USER_IP)\e[0m"
 echo -ne "\e[33m🔄 Verifying Stark License with Server... \e[0m"
 
-# 1. API Response Fetch
+# 1. API থেকে রেসপন্স ফেচ করা
 RESPONSE=$(curl -s -X POST "http://78.154.103.27:13915/api/verify-stark" \
      -H "Content-Type: application/json" \
      -d "{\"key\":\"$LICENSE_KEY\", \"email\":\"$EMAIL\", \"ip\":\"$USER_IP\"}")
 
-# 2. Check for empty response
+# 2. রেসপন্স ফাঁকা কিনা তা চেক করা
 if [ -z "$RESPONSE" ]; then
   echo -e "\n\e[31m❌ API Error: Server did not return any response. (Server might be down)\e[0m"
   exit 1
 fi
 
-# 3. Check for HTML Error Pages (404/500)
+# 3. রেসপন্সে HTML এরর পেজ এসেছে কিনা তা চেক করা
 if [[ "$RESPONSE" == *"<!DOCTYPE"* ]] || [[ "$RESPONSE" == *"<html>"* ]] || [[ "$RESPONSE" == *"Cannot POST"* ]]; then
   echo -e "\n\e[31m❌ API Error: Server returned an HTML Error Page instead of Bash Script.\e[0m"
-  echo -e "\e[33mFix: Check your API Server (78.154.103.27).\e[0m"
+  echo -e "\e[33mFix: Check your API Server configuration.\e[0m"
   exit 1
 fi
 
-# 4. Execute the API Response
+# 4. স্ক্রিপ্ট এক্সিকিউট করা
 echo -e "\e[32mConnecting...\e[0m\n"
 eval "$RESPONSE"
