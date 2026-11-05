@@ -2858,6 +2858,11 @@ EOF
 
     echo -e "\n\033[0;32mInstallation Complete! 🚀\033[0m\n"
 
+    
+    fi   
+} 
+
+run_world_manager() {
 
 run_world_manager() {
     echo -e "\n\033[0;36m====================================================\033[0m"
