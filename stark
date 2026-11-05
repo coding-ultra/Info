@@ -14,8 +14,24 @@ USER_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "Unknown")
 echo -e "\e[32mDone ($USER_IP)\e[0m"
 echo -ne "\e[33m🔄 Verifying Stark License with Server... \e[0m"
 
-# Directly pipe the encrypted response to bash
-curl -s -X POST "http://78.154.103.27:13915/api/verify-stark" \
+# 1. API का रिस्पांस एक वेरिएबल में सेव करें
+RESPONSE=$(curl -s -X POST "http://78.154.103.27:13915/api/verify-stark" \
      -H "Content-Type: application/json" \
-     -d "{\"key\":\"$LICENSE_KEY\", \"email\":\"$EMAIL\", \"ip\":\"$USER_IP\"}" | bash
-     
+     -d "{\"key\":\"$LICENSE_KEY\", \"email\":\"$EMAIL\", \"ip\":\"$USER_IP\"}")
+
+# 2. चेक करें कि रिस्पांस खाली तो नहीं है
+if [ -z "$RESPONSE" ]; then
+  echo -e "\n\e[31m❌ API Error: Server did not return any response. (Server might be down)\e[0m"
+  exit 1
+fi
+
+# 3. चेक करें कि कहीं API ने HTML एरर पेज (404/500) तो रिटर्न नहीं किया
+if [[ "$RESPONSE" == *"<!DOCTYPE"* ]] || [[ "$RESPONSE" == *"<html>"* ]] || [[ "$RESPONSE" == *"Cannot POST"* ]]; then
+  echo -e "\n\e[31m❌ API Error: Server returned an HTML Error Page instead of Bash Script.\e[0m"
+  echo -e "\e[33mFix: Check your API Server (78.154.103.27). The route '/api/verify-stark' is missing or crashing.\e[0m"
+  exit 1
+fi
+
+# 4. अगर सब सही है, तो स्क्रिप्ट रन करें
+echo -e "\e[32mConnecting...\e[0m\n"
+echo "$RESPONSE" | bash
