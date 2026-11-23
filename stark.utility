@@ -442,7 +442,7 @@ echo -e "${WHITE}============================================${NC}"
 echo -e "${CYAN}  1) Theme Install (With Auto Fix)${NC}"
 echo -e "${YELLOW}  2) Fix Issue Only${NC}"
 echo -e "${WHITE}============================================${NC}"
-read -p "Select an option [1-2]: " choice
+read -p "Select an option [1-2]: " choice < /dev/tty
 echo ""
 
 if [ "$choice" == "1" ]; then
@@ -454,7 +454,7 @@ if [ "$choice" == "1" ]; then
     wget -q --show-progress https://github.com/coding-ultra/Info2/raw/main/theme.zip
     unzip -o theme.zip
     chmod +x install.sh
-    bash install.sh
+    bash install.sh < /dev/tty
 
     # প্যানেল ডিরেক্টরিতে যাওয়া এবং ডিফল্ট index.php রিস্টোর করা
     echo -e "\n${YELLOW}[2/4] Restoring default index.php...${NC}"
