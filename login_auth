@@ -1,0 +1,824 @@
+cat << 'BASH_EOF' > /tmp/setup_login_auth.sh
+#!/bin/bash
+set -e
+cd /var/www/pterodactyl
+
+echo ">>> [1/5] Creating OAuthController.php..."
+cat << 'EOF' > app/Http/Controllers/Auth/OAuthController.php
+<?php
+
+namespace Pterodactyl\Http\Controllers\Auth;
+
+use Illuminate\Support\Str;
+use Illuminate\Http\Request;
+use Pterodactyl\Models\User;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Http;
+use Pterodactyl\Services\Dezerx\Addons;
+use Pterodactyl\Http\Controllers\Controller;
+
+class OAuthController extends Controller
+{
+    private function providerConfig(string $provider): ?array
+    {
+        $cfg = Addons::get(Addons::LOGIN_AUTH);
+        if (!($cfg['enabled'] ?? false)) {
+            return null;
+        }
+        if (($cfg[$provider . '_enabled'] ?? '') !== '1') {
+            return null;
+        }
+        $id = trim((string) ($cfg[$provider . '_client_id'] ?? ''));
+        $secret = trim((string) ($cfg[$provider . '_client_secret'] ?? ''));
+        if ($id === '' || $secret === '') {
+            return null;
+        }
+        return ['client_id' => $id, 'client_secret' => $secret];
+    }
+
+    public function redirect(string $provider)
+    {
+        $cfg = $this->providerConfig($provider);
+        if (!$cfg) {
+            return redirect('/auth/login');
+        }
+
+        $state = Str::random(40);
+        session(['dezerx_oauth_state' => $state]);
+        $callback = route('auth.oauth.callback', ['provider' => $provider]);
+
+        $url = match ($provider) {
+            'google' => 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $callback,
+                'response_type' => 'code',
+                'scope' => 'openid email profile',
+                'state' => $state,
+                'prompt' => 'select_account',
+            ]),
+            'discord' => 'https://discord.com/api/oauth2/authorize?' . http_build_query([
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $callback,
+                'response_type' => 'code',
+                'scope' => 'identify email',
+                'state' => $state,
+            ]),
+            'github' => 'https://github.com/login/oauth/authorize?' . http_build_query([
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $callback,
+                'scope' => 'read:user user:email',
+                'state' => $state,
+            ]),
+            default => '/auth/login',
+        };
+
+        return redirect()->away($url);
+    }
+
+    public function callback(Request $request, string $provider)
+    {
+        $cfg = $this->providerConfig($provider);
+        if (!$cfg) {
+            return redirect('/auth/login');
+        }
+
+        $state = (string) session()->pull('dezerx_oauth_state', '');
+        if ($state === '' || !hash_equals($state, (string) $request->query('state', ''))) {
+            return redirect('/auth/login');
+        }
+
+        $code = (string) $request->query('code', '');
+        if ($code === '') {
+            return redirect('/auth/login');
+        }
+
+        $callback = route('auth.oauth.callback', ['provider' => $provider]);
+        $profile = $this->fetchProfile($provider, $cfg, $code, $callback);
+
+        if (!$profile || empty($profile['email'])) {
+            return redirect('/auth/login');
+        }
+
+        $email = strtolower(trim($profile['email']));
+        $user = User::query()->where('email', $email)->first();
+
+        if (!$user) {
+            $baseUsername = preg_replace('/[^a-zA-Z0-9._-]/', '', $profile['username'] ?: explode('@', $email)[0]);
+            if (strlen($baseUsername) < 3) {
+                $baseUsername = 'user' . random_int(100, 999);
+            }
+            $baseUsername = substr($baseUsername, 0, 24);
+            $username = $baseUsername;
+            while (User::query()->where('username', $username)->exists()) {
+                $username = substr($baseUsername, 0, 19) . '_' . random_int(1000, 9999);
+            }
+
+            $user = new User();
+            $user->forceFill([
+                'uuid' => (string) Str::uuid(),
+                'username' => $username,
+                'email' => $email,
+                'name_first' => substr($profile['first'] ?: $username, 0, 191),
+                'name_last' => substr($profile['last'] ?: 'User', 0, 191),
+                'password' => Hash::make(Str::random(32)),
+                'language' => config('app.locale', 'en'),
+                'root_admin' => false,
+            ]);
+            $user->save();
+        }
+
+        Auth::login($user, true);
+        $request->session()->regenerate();
+
+        return redirect('/');
+    }
+
+    private function fetchProfile(string $provider, array $cfg, string $code, string $callback): ?array
+    {
+        if ($provider === 'google') {
+            $token = Http::asForm()->post('https://oauth2.googleapis.com/token', [
+                'client_id' => $cfg['client_id'],
+                'client_secret' => $cfg['client_secret'],
+                'code' => $code,
+                'grant_type' => 'authorization_code',
+                'redirect_uri' => $callback,
+            ])->json('access_token');
+
+            if (!$token) return null;
+
+            $info = Http::withToken($token)->get('https://www.googleapis.com/oauth2/v2/userinfo')->json();
+            return [
+                'email' => $info['email'] ?? null,
+                'username' => explode('@', (string) ($info['email'] ?? ''))[0],
+                'first' => $info['given_name'] ?? ($info['name'] ?? ''),
+                'last' => $info['family_name'] ?? 'User',
+            ];
+        }
+
+        if ($provider === 'discord') {
+            $token = Http::asForm()->post('https://discord.com/api/oauth2/token', [
+                'client_id' => $cfg['client_id'],
+                'client_secret' => $cfg['client_secret'],
+                'grant_type' => 'authorization_code',
+                'code' => $code,
+                'redirect_uri' => $callback,
+            ])->json('access_token');
+
+            if (!$token) return null;
+
+            $info = Http::withToken($token)->get('https://discord.com/api/users/@me')->json();
+            return [
+                'email' => $info['email'] ?? null,
+                'username' => $info['username'] ?? '',
+                'first' => $info['global_name'] ?? ($info['username'] ?? ''),
+                'last' => 'User',
+            ];
+        }
+
+        if ($provider === 'github') {
+            $token = Http::acceptJson()->asForm()->post('https://github.com/login/oauth/access_token', [
+                'client_id' => $cfg['client_id'],
+                'client_secret' => $cfg['client_secret'],
+                'code' => $code,
+                'redirect_uri' => $callback,
+            ])->json('access_token');
+
+            if (!$token) return null;
+
+            $info = Http::withToken($token)->acceptJson()->get('https://api.github.com/user')->json();
+            $email = $info['email'] ?? null;
+
+            if (!$email) {
+                $emails = Http::withToken($token)->acceptJson()->get('https://api.github.com/user/emails')->json();
+                if (is_array($emails)) {
+                    foreach ($emails as $row) {
+                        if (($row['primary'] ?? false) && ($row['verified'] ?? false)) {
+                            $email = $row['email'] ?? null;
+                            break;
+                        }
+                    }
+                    if (!$email && isset($emails[0]['email'])) {
+                        $email = $emails[0]['email'];
+                    }
+                }
+            }
+
+            $parts = explode(' ', trim((string) ($info['name'] ?? '')), 2);
+            return [
+                'email' => $email,
+                'username' => $info['login'] ?? '',
+                'first' => $parts[0] ?: ($info['login'] ?? ''),
+                'last' => $parts[1] ?? 'User',
+            ];
+        }
+
+        return null;
+    }
+}
+EOF
+
+echo ">>> [2/5] Creating SocialAuthButtons.tsx..."
+cat << 'EOF' > resources/scripts/components/auth/SocialAuthButtons.tsx
+import React from 'react';
+
+interface OAuthFlags {
+    google?: boolean;
+    discord?: boolean;
+    github?: boolean;
+}
+
+const SocialAuthButtons = () => {
+    const flags: OAuthFlags = (window as any).DezerxLoginAuth || {};
+    const providers = [
+        flags.google && {
+            id: 'google',
+            label: 'Google',
+            icon: (
+                <svg className={'h-4 w-4'} viewBox={'0 0 24 24'} aria-hidden={'true'}>
+                    <path fill={'#EA4335'} d={'M12 10.2v3.9h5.4c-.2 1.3-1.5 3.9-5.4 3.9-3.2 0-5.9-2.7-5.9-6s2.7-6 5.9-6c1.9 0 3.1.8 3.8 1.5l2.6-2.5C16.7 3.4 14.6 2.5 12 2.5 6.8 2.5 2.5 6.8 2.5 12s4.3 9.5 9.5 9.5c5.5 0 9.1-3.9 9.1-9.3 0-.6-.1-1.1-.2-1.6H12z'} />
+                </svg>
+            ),
+        },
+        flags.discord && {
+            id: 'discord',
+            label: 'Discord',
+            icon: (
+                <svg className={'h-4 w-4'} viewBox={'0 0 24 24'} aria-hidden={'true'}>
+                    <path fill={'#5865F2'} d={'M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.028C.533 9.046-.32 13.58.099 18.058a.082.082 0 0 0 .031.056 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.1 14.1 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .078-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.1.246.198.373.292a.077.077 0 0 1-.006.128 12.3 12.3 0 0 1-1.873.891.077.077 0 0 0-.041.107c.36.698.772 1.363 1.225 1.993a.076.076 0 0 0 .084.029 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.055c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.029zM8.02 15.331c-1.182 0-2.157-1.086-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.946 2.418-2.157 2.418z'} />
+                </svg>
+            ),
+        },
+        flags.github && {
+            id: 'github',
+            label: 'GitHub',
+            icon: (
+                <svg className={'h-4 w-4'} viewBox={'0 0 24 24'} fill={'currentColor'} aria-hidden={'true'}>
+                    <path d={'M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55v-1.94c-3.2.7-3.87-1.54-3.87-1.54-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.17 1.18a11.03 11.03 0 0 1 5.78 0c2.2-1.49 3.17-1.18 3.17-1.18.62 1.58.23 2.75.11 3.04.74.8 1.18 1.83 1.18 3.08 0 4.41-2.69 5.39-5.26 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.66.79.55A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z'} />
+                </svg>
+            ),
+        },
+    ].filter(Boolean) as Array<{ id: string; label: string; icon: React.ReactNode }>;
+
+    if (providers.length === 0) {
+        return null;
+    }
+
+    return (
+        <div className={'space-y-3 pt-2'}>
+            <div className={'relative flex items-center justify-center'}>
+                <div className={'w-full border-t border-white/10'} />
+                <span className={'bg-base px-3 text-xs text-ink-faint whitespace-nowrap'}>
+                    Or continue with
+                </span>
+                <div className={'w-full border-t border-white/10'} />
+            </div>
+            <div className={'grid gap-2.5'} style={{ gridTemplateColumns: `repeat(${providers.length}, minmax(0, 1fr))` }}>
+                {providers.map((p) => (
+                    <a
+                        key={p.id}
+                        href={`/auth/oauth/${p.id}`}
+                        className={'flex items-center justify-center gap-2 rounded-xl border border-white/10 bg-raised px-3 py-2.5 text-sm font-medium text-ink transition-colors hover:border-accent/50 hover:bg-raised/80'}
+                    >
+                        {p.icon}
+                        <span>{p.label}</span>
+                    </a>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+export default SocialAuthButtons;
+EOF
+
+echo ">>> [3/5] Patching PHP & Blade files..."
+php << 'PHP_EOF'
+<?php
+// 1. Patch app/Services/Dezerx/Addons.php
+$f = 'app/Services/Dezerx/Addons.php';
+$c = file_get_contents($f);
+if (strpos($c, 'LOGIN_AUTH') === false) {
+    $c = str_replace(
+        "public const DAYZ_MOD_MANAGER = 'dayz-mods';",
+        "public const DAYZ_MOD_MANAGER = 'dayz-mods'; public const LOGIN_AUTH = 'login-auth';",
+        $c
+    );
+    $c = str_replace(
+        "'icon' => 'fa-google', ], ];",
+        "'icon' => 'fa-google', ], self::LOGIN_AUTH => [ 'name' => 'Login Auth', 'blurb' => 'Let users sign in or register with Google, Discord, or GitHub directly from the login and register pages.', 'icon' => 'fa-sign-in', ], ];",
+        $c
+    );
+    $c = str_replace(
+        "self::ADMIN_THEME, ];",
+        "self::ADMIN_THEME, self::LOGIN_AUTH, ];",
+        $c
+    );
+    $c = str_replace(
+        "self::ADMIN_THEME => [AdminTheme::MODE_KEY, AdminTheme::HINTS_KEY], ];",
+        "self::ADMIN_THEME => [AdminTheme::MODE_KEY, AdminTheme::HINTS_KEY], self::LOGIN_AUTH => ['google_enabled', 'google_client_id', 'google_client_secret', 'discord_enabled', 'discord_client_id', 'discord_client_secret', 'github_enabled', 'github_client_id', 'github_client_secret'], ];",
+        $c
+    );
+    $c = str_replace(
+        "self::ADMIN_THEME => [ 'enabled' => false, 'eggs' => [], ], ];",
+        "self::ADMIN_THEME => [ 'enabled' => false, 'eggs' => [], ], self::LOGIN_AUTH => [ 'enabled' => false, 'eggs' => [], ], ];",
+        $c
+    );
+    file_put_contents($f, $c);
+}
+
+// 2. Patch app/Http/Controllers/Admin/Dezerx/AddonsController.php
+$f = 'app/Http/Controllers/Admin/Dezerx/AddonsController.php';
+$c = file_get_contents($f);
+if (strpos($c, 'LOGIN_AUTH') === false) {
+    $labels = " 'google_enabled' => ['label' => 'Google Auth', 'choices' => ['' => 'Disabled', '1' => 'Enabled'], 'help' => 'Show Google sign-in button on login and register pages.'], 'discord_enabled' => ['label' => 'Discord Auth', 'choices' => ['' => 'Disabled', '1' => 'Enabled'], 'help' => 'Show Discord sign-in button on login and register pages.'], 'discord_client_id' => ['label' => 'Discord Client ID', 'placeholder' => '123456789012345678', 'help' => 'From Discord Developer Portal → OAuth2.'], 'discord_client_secret' => ['label' => 'Discord Client Secret', 'placeholder' => '••••••••', 'help' => 'Stored on the panel and never sent to browsers.'], 'github_enabled' => ['label' => 'GitHub Auth', 'choices' => ['' => 'Disabled', '1' => 'Enabled'], 'help' => 'Show GitHub sign-in button on login and register pages.'], 'github_client_id' => ['label' => 'GitHub Client ID', 'placeholder' => 'Ov23li…', 'help' => 'From GitHub Settings → Developer settings → OAuth Apps.'], 'github_client_secret' => ['label' => 'GitHub Client Secret', 'placeholder' => '••••••••', 'help' => 'Stored on the panel and never sent to browsers.'], ";
+    $c = str_replace(
+        "private const EXTRA_TITLES = [",
+        $labels . "]; private const EXTRA_TITLES = [",
+        str_replace("]; private const EXTRA_TITLES = [", "private const EXTRA_TITLES = [", $c)
+    );
+    $c = str_replace(
+        "Addons::DAYZ_MOD_MANAGER => 'Steam', ];",
+        "Addons::DAYZ_MOD_MANAGER => 'Steam', Addons::LOGIN_AUTH => 'OAuth Providers', ];",
+        $c
+    );
+    $setupCode = "if (\$addon === Addons::LOGIN_AUTH) { return [[ 'title' => 'Callback URLs', 'body' => 'Add these exact Redirect / Callback URLs in your Google, Discord, and GitHub OAuth apps:', 'fields' => [ ['label' => 'Google Callback URL', 'value' => route('auth.oauth.callback', ['provider' => 'google']), 'note' => 'Google Cloud Console → Credentials → OAuth 2.0 Client'], ['label' => 'Discord Callback URL', 'value' => route('auth.oauth.callback', ['provider' => 'discord']), 'note' => 'Discord Developer Portal → OAuth2 → Redirects'], ['label' => 'GitHub Callback URL', 'value' => route('auth.oauth.callback', ['provider' => 'github']), 'note' => 'GitHub Developer Settings → OAuth Apps → Authorization callback URL'], ], ]]; } ";
+    $c = str_replace(
+        "if (\$addon !== Addons::DRIVE_BACKUPS) { return []; }",
+        $setupCode . "if (\$addon !== Addons::DRIVE_BACKUPS) { return []; }",
+        $c
+    );
+    file_put_contents($f, $c);
+}
+
+// 3. Patch routes/auth.php
+$f = 'routes/auth.php';
+$c = file_get_contents($f);
+if (strpos($c, 'OAuthController') === false) {
+    $routes = "Route::get('/oauth/{provider}', [Auth\\OAuthController::class, 'redirect'])->whereIn('provider', ['google', 'discord', 'github'])->name('auth.oauth.redirect');\nRoute::get('/oauth/{provider}/callback', [Auth\\OAuthController::class, 'callback'])->whereIn('provider', ['google', 'discord', 'github'])->name('auth.oauth.callback');\n";
+    $c = str_replace(
+        "Route::fallback([Auth\\LoginController::class, 'index']);",
+        $routes . "Route::fallback([Auth\\LoginController::class, 'index']);",
+        $c
+    );
+    file_put_contents($f, $c);
+}
+
+// 4. Patch resources/views/templates/wrapper.blade.php
+$f = 'resources/views/templates/wrapper.blade.php';
+$c = file_get_contents($f);
+if (strpos($c, 'DezerxLoginAuth') === false) {
+    $inject = '@php($dzAuth = \Pterodactyl\Services\Dezerx\Addons::get(\Pterodactyl\Services\Dezerx\Addons::LOGIN_AUTH))<script>window.DezerxLoginAuth = @json(["google" => ($dzAuth["enabled"] ?? false) && ($dzAuth["google_enabled"] ?? "") === "1" && ($dzAuth["google_client_id"] ?? "") !== "", "discord" => ($dzAuth["enabled"] ?? false) && ($dzAuth["discord_enabled"] ?? "") === "1" && ($dzAuth["discord_client_id"] ?? "") !== "", "github" => ($dzAuth["enabled"] ?? false) && ($dzAuth["github_enabled"] ?? "") === "1" && ($dzAuth["github_client_id"] ?? "") !== ""]);</script>';
+    $c = str_replace('</head>', $inject . '</head>', $c);
+    file_put_contents($f, $c);
+}
+
+// 5. Patch LoginContainer.tsx & RegisterContainer.tsx
+$f = 'resources/scripts/components/auth/LoginContainer.tsx';
+$c = file_get_contents($f);
+if (strpos($c, 'SocialAuthButtons') === false) {
+    $c = str_replace(
+        "import DemoSignIn from '@/dezerx/components/DemoSignIn';",
+        "import DemoSignIn from '@/dezerx/components/DemoSignIn'; import SocialAuthButtons from '@/components/auth/SocialAuthButtons';",
+        $c
+    );
+    $c = str_replace(
+        "<DemoSignIn",
+        "<SocialAuthButtons /> <DemoSignIn",
+        $c
+    );
+    file_put_contents($f, $c);
+}
+
+$f = 'resources/scripts/components/auth/RegisterContainer.tsx';
+$c = file_get_contents($f);
+if (strpos($c, 'SocialAuthButtons') === false) {
+    $c = str_replace(
+        "import { useT } from '@/i18n';",
+        "import { useT } from '@/i18n'; import SocialAuthButtons from '@/components/auth/SocialAuthButtons';",
+        $c
+    );
+    $c = str_replace(
+        "</Form>",
+        "<SocialAuthButtons /> </Form>",
+        $c
+    );
+    file_put_contents($f, $c);
+}
+PHP_EOF
+
+echo ">>> [4/5] Building frontend (webpack)..."
+NODE_ENV=production node ./node_modules/webpack/bin/webpack.js --mode production
+
+echo ">>> [5/5] Clearing caches & fixing permissions..."
+chown -R www-data:www-data /var/www/pterodactyl/storage /var/www/pterodactyl/bootstrap/cache /var/www/pterodactyl/public/assets
+php artisan optimize:clear
+systemctl restart php8.3-fpm 2>/dev/null || systemctl restart php8.4-fpm 2>/dev/null
+
+echo ">>> Done! Open Admin -> Addons -> Login Auth to configure."
+BASH_EOF
+bash /tmp/setup_login_auth.sh
+cd /var/www/pterodactyl && php << 'PHP_EOF'
+<?php
+$f = 'app/Http/Controllers/Admin/Dezerx/AddonsController.php';
+$c = file_get_contents($f);
+
+$newSetup = <<<'CODE'
+if ($addon === Addons::LOGIN_AUTH) {
+            $appUrl = rtrim(config('app.url'), '/');
+            return [
+                [
+                    'title' => '1. Google OAuth Setup',
+                    'body' => 'Open <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Google Cloud Console</a>, select or create a project, and set up the <strong>OAuth consent screen</strong> (External). Then click <strong>Create credentials → OAuth client ID → Web application</strong> and paste these exact URLs:',
+                    'fields' => [
+                        [
+                            'label' => 'Authorised JavaScript origins',
+                            'value' => $appUrl,
+                            'note' => 'Your panel base URL without a trailing slash.',
+                        ],
+                        [
+                            'label' => 'Authorised redirect URIs',
+                            'value' => route('auth.oauth.callback', ['provider' => 'google']),
+                            'note' => 'Must match character for character, including https://.',
+                        ],
+                    ],
+                ],
+                [
+                    'title' => '2. Discord OAuth Setup',
+                    'body' => 'Open the <a href="https://discord.com/developers/applications" target="_blank" rel="noreferrer">Discord Developer Portal</a>, click <strong>New Application</strong>, go to <strong>OAuth2</strong> in the left menu, and add the Redirect URL below. Copy the <strong>Client ID</strong> and click <strong>Reset Secret</strong> to get your Client Secret:',
+                    'fields' => [
+                        [
+                            'label' => 'Redirects (Callback URL)',
+                            'value' => route('auth.oauth.callback', ['provider' => 'discord']),
+                            'note' => 'Paste this under OAuth2 → Redirects and save changes.',
+                        ],
+                    ],
+                ],
+                [
+                    'title' => '3. GitHub OAuth Setup',
+                    'body' => 'Open <a href="https://github.com/settings/developers" target="_blank" rel="noreferrer">GitHub Developer Settings</a>, go to <strong>OAuth Apps → New OAuth App</strong>, and enter the URLs below. After creating the app, click <strong>Generate a new client secret</strong> and copy both keys:',
+                    'fields' => [
+                        [
+                            'label' => 'Homepage URL',
+                            'value' => $appUrl,
+                            'note' => 'Your panel home URL.',
+                        ],
+                        [
+                            'label' => 'Authorization callback URL',
+                            'value' => route('auth.oauth.callback', ['provider' => 'github']),
+                            'note' => 'GitHub will redirect users back here after login.',
+                        ],
+                    ],
+                ],
+                [
+                    'title' => '4. Enable & Save',
+                    'body' => 'Paste the Client ID and Client Secret for the providers you want in the <strong>OAuth Providers</strong> section below, switch them to <strong>Enabled</strong>, turn on the main addon toggle at the top, and click <strong>Save</strong>. Disabled providers stay completely hidden from the login and register pages.',
+                    'fields' => [],
+                ],
+            ];
+        }
+CODE;
+
+// Replace old LOGIN_AUTH setup block if it exists, otherwise insert before DRIVE_BACKUPS check
+if (preg_match('/if\s*\(\$addon\s*===\s*Addons::LOGIN_AUTH\)\s*\{.*?\}\s*(?=if\s*\(\$addon\s*!==\s*Addons::DRIVE_BACKUPS\))/s', $c)) {
+    $c = preg_replace('/if\s*\(\$addon\s*===\s*Addons::LOGIN_AUTH\)\s*\{.*?\}\s*(?=if\s*\(\$addon\s*!==\s*Addons::DRIVE_BACKUPS\))/s', $newSetup . "\n        ", $c, 1);
+} else {
+    $c = str_replace(
+        'if ($addon !== Addons::DRIVE_BACKUPS) { return []; }',
+        $newSetup . ' if ($addon !== Addons::DRIVE_BACKUPS) { return []; }',
+        $c
+    );
+}
+
+file_put_contents($f, $c);
+echo "Updated AddonsController.php successfully!\n";
+PHP_EOF
+php artisan optimize:clear
+cat << 'BASH_EOF' > /tmp/upgrade_login_auth.sh
+#!/bin/bash
+set -e
+cd /var/www/pterodactyl
+
+echo ">>> [1/4] Creating dedicated secure Admin UI (login-auth.blade.php)..."
+cat << 'EOF' > resources/views/admin/dezerx/addons/login-auth.blade.php
+@extends('layouts.admin')
+
+@section('title')
+    Login Auth
+@endsection
+
+@section('content-header')
+    <h1>Login Auth<small>Google, Discord &amp; GitHub OAuth sign-in settings</small></h1>
+    <ol class="breadcrumb">
+        <li><a href="{{ route('admin.index') }}">Admin</a></li>
+        <li><a href="{{ route('admin.dezerx.addons.index') }}">Addons</a></li>
+        <li class="active">Login Auth</li>
+    </ol>
+@endsection
+
+@section('content')
+<style>
+    .dz-switch { position: relative; display: inline-block; width: 44px; height: 24px; margin: 0; vertical-align: middle; }
+    .dz-switch input { opacity: 0; width: 0; height: 0; }
+    .dz-slider { position: absolute; cursor: pointer; inset: 0; background: rgba(148,163,184,0.35); border-radius: 999px; transition: .2s; }
+    .dz-slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+    .dz-switch input:checked + .dz-slider { background: #22c55e; }
+    .dz-switch input:checked + .dz-slider:before { transform: translateX(20px); }
+    .dz-provider-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .dz-provider-title { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 16px; margin: 0; }
+    .dz-copy-row { display: flex; gap: 6px; }
+    .dz-copy-row input { font-family: monospace; font-size: 12px; }
+    .dz-saved-badge { display: inline-block; margin-left: 6px; padding: 2px 7px; font-size: 11px; border-radius: 999px; background: rgba(34,197,94,0.15); color: #22c55e; font-weight: 600; }
+</style>
+
+@php
+    $appUrl = rtrim(config('app.url'), '/');
+    $providers = [
+        'google' => [
+            'name' => 'Google',
+            'portal_name' => 'Google Cloud Console',
+            'portal_url' => 'https://console.cloud.google.com/apis/credentials',
+            'guide' => 'Create an OAuth 2.0 Web Application client (set OAuth Consent Screen to External), then add the URLs below.',
+            'extra_url_label' => 'Authorised JavaScript origin',
+            'extra_url' => $appUrl,
+            'callback_label' => 'Authorised redirect URI',
+            'callback' => route('auth.oauth.callback', ['provider' => 'google']),
+            'icon' => '<svg width="20" height="20" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>',
+        ],
+        'discord' => [
+            'name' => 'Discord',
+            'portal_name' => 'Discord Developer Portal',
+            'portal_url' => 'https://discord.com/developers/applications',
+            'guide' => 'Create an application, open OAuth2, add the Redirect URL below, then copy Client ID and Reset Secret.',
+            'extra_url_label' => null,
+            'extra_url' => null,
+            'callback_label' => 'Redirect URL',
+            'callback' => route('auth.oauth.callback', ['provider' => 'discord']),
+            'icon' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="#5865F2"><path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.028C.533 9.046-.32 13.58.099 18.058a.082.082 0 0 0 .031.056 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.1 14.1 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .078-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.1.246.198.373.292a.077.077 0 0 1-.006.128 12.3 12.3 0 0 1-1.873.891.077.077 0 0 0-.041.107c.36.698.772 1.363 1.225 1.993a.076.076 0 0 0 .084.029 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.055c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.029zM8.02 15.331c-1.182 0-2.157-1.086-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.946 2.418-2.157 2.418z"/></svg>',
+        ],
+        'github' => [
+            'name' => 'GitHub',
+            'portal_name' => 'GitHub Developer Settings',
+            'portal_url' => 'https://github.com/settings/developers',
+            'guide' => 'Go to OAuth Apps → New OAuth App, paste the URLs below, then generate a new client secret.',
+            'extra_url_label' => 'Homepage URL',
+            'extra_url' => $appUrl,
+            'callback_label' => 'Authorization callback URL',
+            'callback' => route('auth.oauth.callback', ['provider' => 'github']),
+            'icon' => '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2z"/></svg>',
+        ],
+    ];
+@endphp
+
+<form action="{{ route('admin.dezerx.addons.update', $key) }}" method="POST" autocomplete="off">
+    @csrf
+    @if (!empty($formMethod) && strtoupper($formMethod) !== 'POST')
+        @method($formMethod)
+    @endif
+
+    <div class="row">
+        <div class="col-xs-12">
+            <div class="box box-primary">
+                <div class="box-body dz-provider-head">
+                    <div>
+                        <h3 style="margin:0 0 4px 0;font-size:18px;">Enable Login Auth</h3>
+                        <p class="text-muted" style="margin:0;">Master switch for social login buttons on the Login &amp; Register pages. Saved Client IDs &amp; Secrets are hidden for security.</p>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:14px;">
+                        <input type="hidden" name="enabled" value="0">
+                        <label class="dz-switch">
+                            <input type="checkbox" name="enabled" value="1" {{ !empty($config['enabled']) ? 'checked' : '' }}>
+                            <span class="dz-slider"></span>
+                        </label>
+                        <button type="submit" class="btn btn-primary btn-sm">Save All</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        @foreach ($providers as $pid => $p)
+            @php
+                $isOn = ($config[$pid . '_enabled'] ?? '') === '1';
+                $hasId = trim((string) ($config[$pid . '_client_id'] ?? '')) !== '';
+                $hasSecret = trim((string) ($config[$pid . '_client_secret'] ?? '')) !== '';
+            @endphp
+            <div class="col-md-4 col-xs-12">
+                <div class="box">
+                    <div class="box-header with-border dz-provider-head">
+                        <h3 class="dz-provider-title">{!! $p['icon'] !!} <span>{{ $p['name'] }} Auth</span></h3>
+                        <div>
+                            <input type="hidden" name="extras[{{ $pid }}_enabled]" value="">
+                            <label class="dz-switch" title="Enable {{ $p['name'] }}">
+                                <input type="checkbox" name="extras[{{ $pid }}_enabled]" value="1" {{ $isOn ? 'checked' : '' }}>
+                                <span class="dz-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="box-body">
+                        <div class="form-group">
+                            <label>
+                                {{ $p['name'] }} Client ID
+                                @if ($hasId)<span class="dz-saved-badge">Saved</span>@endif
+                            </label>
+                            <input
+                                type="password"
+                                name="extras[{{ $pid }}_client_id]"
+                                value=""
+                                class="form-control"
+                                autocomplete="new-password"
+                                placeholder="{{ $hasId ? '•••••••• (Saved — leave blank to keep)' : 'Enter Client ID' }}"
+                            >
+                        </div>
+
+                        <div class="form-group">
+                            <label>
+                                {{ $p['name'] }} Client Secret
+                                @if ($hasSecret)<span class="dz-saved-badge">Saved</span>@endif
+                            </label>
+                            <input
+                                type="password"
+                                name="extras[{{ $pid }}_client_secret]"
+                                value=""
+                                class="form-control"
+                                autocomplete="new-password"
+                                placeholder="{{ $hasSecret ? '•••••••• (Saved — leave blank to keep)' : 'Enter Client Secret' }}"
+                            >
+                        </div>
+
+                        <hr style="margin:14px 0;opacity:.2;">
+
+                        <p class="text-muted small" style="margin-bottom:10px;">
+                            Open <a href="{{ $p['portal_url'] }}" target="_blank" rel="noreferrer"><strong>{{ $p['portal_name'] }}</strong></a> — {{ $p['guide'] }}
+                        </p>
+
+                        @if ($p['extra_url'])
+                            <div class="form-group">
+                                <label class="small">{{ $p['extra_url_label'] }}</label>
+                                <div class="dz-copy-row">
+                                    <input type="text" class="form-control input-sm" value="{{ $p['extra_url'] }}" readonly>
+                                    <button type="button" class="btn btn-default btn-sm dz-copy-btn" data-copy="{{ $p['extra_url'] }}">Copy</button>
+                                </div>
+                            </div>
+                        @endif
+
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label class="small">{{ $p['callback_label'] }}</label>
+                            <div class="dz-copy-row">
+                                <input type="text" class="form-control input-sm" value="{{ $p['callback'] }}" readonly>
+                                <button type="button" class="btn btn-default btn-sm dz-copy-btn" data-copy="{{ $p['callback'] }}">Copy</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        @endforeach
+    </div>
+
+    <div class="row">
+        <div class="col-xs-12 text-right" style="margin-bottom:20px;">
+            <a href="{{ route('admin.dezerx.addons.index') }}" class="btn btn-default">Back to Addons</a>
+            <button type="submit" class="btn btn-primary">Save Settings</button>
+        </div>
+    </div>
+</form>
+
+<script>
+document.querySelectorAll('.dz-copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+        var text = btn.getAttribute('data-copy');
+        navigator.clipboard.writeText(text).then(function () {
+            var old = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(function () { btn.textContent = old; }, 1400);
+        });
+    });
+});
+</script>
+@endsection
+EOF
+
+echo ">>> [2/4] Patching AddonsController.php to use custom view & preserve hidden keys..."
+php << 'PHP_EOF'
+<?php
+// Detect HTTP method used by manage.blade.php (POST vs PATCH vs PUT)
+$manage = @file_get_contents('resources/views/admin/dezerx/addons/manage.blade.php') ?: '';
+$method = 'POST';
+if (preg_match("/@method\(['\"](PATCH|PUT)['\"]\)/i", $manage, $m)) {
+    $method = strtoupper($m[1]);
+} elseif (preg_match('/name="_method"\s+value="(PATCH|PUT)"/i', $manage, $m)) {
+    $method = strtoupper($m[1]);
+}
+
+$f = 'app/Http/Controllers/Admin/Dezerx/AddonsController.php';
+$c = file_get_contents($f);
+
+// 1. Return custom login-auth view in show()
+if (strpos($c, "admin.dezerx.addons.login-auth") === false) {
+    $customShow = "if (\$addon === Addons::LOGIN_AUTH) { return view('admin.dezerx.addons.login-auth', ['key' => \$addon, 'meta' => \$this->meta(\$addon), 'config' => Addons::get(\$addon), 'formMethod' => '{$method}']); } ";
+    $c = str_replace(
+        "if (\$addon === Addons::DISCORD_BOT) { return redirect()->route('admin.dezerx.discordbot'); }",
+        "if (\$addon === Addons::DISCORD_BOT) { return redirect()->route('admin.dezerx.discordbot'); } " . $customShow,
+        $c
+    );
+}
+
+// 2. Preserve existing Client ID / Secret when left blank in update()
+if (strpos($c, '_client_secret') === false || strpos($c, 'preserve_secret_patch') === false) {
+    $oldLoop = "if (array_key_exists(\$extra, \$data['extras'] ?? [])) { \$extras[\$extra] = (string) (\$data['extras'][\$extra] ?? ''); }";
+    $newLoop = "if (array_key_exists(\$extra, \$data['extras'] ?? [])) { /* preserve_secret_patch */ \$val = (string) (\$data['extras'][\$extra] ?? ''); if (\$addon === Addons::LOGIN_AUTH && (str_ends_with(\$extra, '_client_id') || str_ends_with(\$extra, '_client_secret')) && trim(\$val) === '') { continue; } \$extras[\$extra] = \$val; }";
+    $c = str_replace($oldLoop, $newLoop, $c);
+}
+
+file_put_contents($f, $c);
+echo "Patched AddonsController.php (method={$method})\n";
+PHP_EOF
+
+echo ">>> [3/4] Updating SocialAuthButtons.tsx with official icons & full-width pill buttons..."
+cat << 'EOF' > resources/scripts/components/auth/SocialAuthButtons.tsx
+import React from 'react';
+
+interface OAuthFlags {
+    google?: boolean;
+    discord?: boolean;
+    github?: boolean;
+}
+
+const SocialAuthButtons = () => {
+    const flags: OAuthFlags = (window as any).DezerxLoginAuth || {};
+    const providers = [
+        flags.google && {
+            id: 'google',
+            label: 'Continue with Google',
+            icon: (
+                <svg className={'h-5 w-5 shrink-0'} viewBox={'0 0 24 24'} aria-hidden={'true'}>
+                    <path fill={'#4285F4'} d={'M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z'} />
+                    <path fill={'#34A853'} d={'M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z'} />
+                    <path fill={'#FBBC05'} d={'M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z'} />
+                    <path fill={'#EA4335'} d={'M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z'} />
+                </svg>
+            ),
+        },
+        flags.discord && {
+            id: 'discord',
+            label: 'Continue with Discord',
+            icon: (
+                <svg className={'h-5 w-5 shrink-0'} viewBox={'0 0 24 24'} fill={'#5865F2'} aria-hidden={'true'}>
+                    <path d={'M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.74 19.74 0 0 0 3.677 4.37a.07.07 0 0 0-.032.028C.533 9.046-.32 13.58.099 18.058a.082.082 0 0 0 .031.056 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.1 14.1 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128c.126-.094.252-.192.372-.291a.074.074 0 0 1 .078-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.009c.12.1.246.198.373.292a.077.077 0 0 1-.006.128 12.3 12.3 0 0 1-1.873.891.077.077 0 0 0-.041.107c.36.698.772 1.363 1.225 1.993a.076.076 0 0 0 .084.029 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.055c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.029zM8.02 15.331c-1.182 0-2.157-1.086-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.946 2.418-2.157 2.418z'} />
+                </svg>
+            ),
+        },
+        flags.github && {
+            id: 'github',
+            label: 'Continue with GitHub',
+            icon: (
+                <svg className={'h-5 w-5 shrink-0'} viewBox={'0 0 24 24'} fill={'currentColor'} aria-hidden={'true'}>
+                    <path fillRule={'evenodd'} clipRule={'evenodd'} d={'M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0 1 12 6.844a9.59 9.59 0 0 1 2.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0 0 22 12.017C22 6.484 17.522 2 12 2z'} />
+                </svg>
+            ),
+        },
+    ].filter(Boolean) as Array<{ id: string; label: string; icon: React.ReactNode }>;
+
+    if (providers.length === 0) {
+        return null;
+    }
+
+    return (
+        <div className={'space-y-3 pt-2'}>
+            <div className={'relative flex items-center justify-center'}>
+                <div className={'w-full border-t border-white/10'} />
+                <span className={'bg-base px-3 text-xs text-ink-faint whitespace-nowrap'}>
+                    Or continue with
+                </span>
+                <div className={'w-full border-t border-white/10'} />
+            </div>
+            <div className={'flex flex-col gap-2.5'}>
+                {providers.map((p) => (
+                    <a
+                        key={p.id}
+                        href={`/auth/oauth/${p.id}`}
+                        className={'flex w-full items-center justify-center gap-3 rounded-full border border-white/10 bg-raised px-5 py-3 text-sm font-medium text-ink transition-all hover:border-white/20 hover:bg-raised/80'}
+                    >
+                        {p.icon}
+                        <span>{p.label}</span>
+                    </a>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+export default SocialAuthButtons;
+EOF
+
+echo ">>> [4/4] Building frontend & clearing cache..."
+NODE_ENV=production node ./node_modules/webpack/bin/webpack.js --mode production
+chown -R www-data:www-data /var/www/pterodactyl/storage /var/www/pterodactyl/bootstrap/cache /var/www/pterodactyl/public/assets /var/www/pterodactyl/resources/views/admin/dezerx/addons/login-auth.blade.php
+php artisan optimize:clear
+systemctl restart php8.3-fpm 2>/dev/null || systemctl restart php8.4-fpm 2>/dev/null
+
+echo ">>> Upgrade Complete!"
+BASH_EOF
+bash /tmp/upgrade_login_auth.sh
+sed -i "s|{{ route('admin.dezerx.addons.index') }}|/admin/dezerx/addons|g" /var/www/pterodactyl/resources/views/admin/dezerx/addons/login-auth.blade.php && php artisan view:clear
